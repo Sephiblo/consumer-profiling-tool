@@ -1,0 +1,108 @@
+"""Dynamic scoring engine for v2 profile dimensions."""
+
+from __future__ import annotations
+
+import numpy as np
+import pandas as pd
+
+from analysis.recommendation_engine import add_customer_recommendations
+from core.constants import IDENTITY_ROLES, SCORE_GROUPS
+from core.models import ConfirmedFieldMapping
+from preprocessing.normalizer import apply_polarity, robust_minmax
+
+
+RICHNESS_GROUPS = {
+    "identity_completeness_score",
+    "demographic_richness_score",
+    "geographic_richness_score",
+    "psychographic_richness_score",
+}
+
+
+def _fields_for_group(mappings: list[ConfirmedFieldMapping], group_name: str, df: pd.DataFrame) -> list[ConfirmedFieldMapping]:
+    roles = set(SCORE_GROUPS[group_name])
+    return [mapping for mapping in mappings if mapping.role in roles and mapping.name in df.columns and mapping.role != "ignore"]
+
+
+def _score_numeric_field(series: pd.Series, polarity: str) -> pd.Series | None:
+    numeric = pd.to_numeric(series, errors="coerce")
+    if numeric.notna().sum() == 0:
+        return None
+    filled = numeric.fillna(numeric.median())
+    return apply_polarity(robust_minmax(filled), polarity)
+
+
+def calculate_score_group(df: pd.DataFrame, mappings: list[ConfirmedFieldMapping], group_name: str) -> pd.Series | None:
+    """Calculate a 0-100 score group, or None if the group is unavailable."""
+    if group_name not in SCORE_GROUPS:
+        raise ValueError(f"Unknown score group: {group_name}")
+    group_mappings = _fields_for_group(mappings, group_name, df)
+    if not group_mappings:
+        return None
+
+    if group_name in RICHNESS_GROUPS:
+        completeness = pd.concat([df[mapping.name].notna().astype(float) for mapping in group_mappings], axis=1).mean(axis=1)
+        return (completeness * 100).round(2)
+
+    scores: list[pd.Series] = []
+    for mapping in group_mappings:
+        score = _score_numeric_field(df[mapping.name], mapping.polarity)
+        if score is not None:
+            scores.append(score)
+    if not scores:
+        return None
+    return (pd.concat(scores, axis=1).mean(axis=1) * 100).round(2)
+
+
+def calculate_risk_scores(df: pd.DataFrame, mappings: list[ConfirmedFieldMapping]) -> tuple[pd.Series | None, pd.Series | None]:
+    risk_roles = set(SCORE_GROUPS["risk_score"])
+    raw_scores: list[pd.Series] = []
+    health_scores: list[pd.Series] = []
+    for mapping in mappings:
+        if mapping.role not in risk_roles or mapping.name not in df.columns:
+            continue
+        numeric = pd.to_numeric(df[mapping.name], errors="coerce")
+        if numeric.notna().sum() == 0:
+            continue
+        normalised = robust_minmax(numeric.fillna(numeric.median()))
+        raw = normalised if mapping.polarity == "negative" else 1 - normalised
+        raw_scores.append(raw)
+        health_scores.append(1 - raw)
+    if not raw_scores:
+        return None, None
+    return (
+        (pd.concat(raw_scores, axis=1).mean(axis=1) * 100).round(2),
+        (pd.concat(health_scores, axis=1).mean(axis=1) * 100).round(2),
+    )
+
+
+def generate_customer_scores(
+    df: pd.DataFrame,
+    mappings: list[ConfirmedFieldMapping],
+    cluster_labels: pd.Series | np.ndarray | None = None,
+) -> pd.DataFrame:
+    """Append dynamic profile scores and recommended actions to customers."""
+    scored = df.copy()
+    id_field = next((mapping.name for mapping in mappings if mapping.role in IDENTITY_ROLES and mapping.name in scored.columns), None)
+    segment_field = next((mapping.name for mapping in mappings if mapping.role == "existing_segment" and mapping.name in scored.columns), None)
+    scored["_customer_profile_id"] = scored[id_field].astype(str) if id_field else [f"record_{idx + 1}" for idx in range(len(scored))]
+    if segment_field:
+        scored["_original_segment"] = scored[segment_field].astype(str)
+    if cluster_labels is not None:
+        scored["_generated_cluster"] = pd.Series(cluster_labels, index=scored.index).astype(str)
+
+    for group_name in SCORE_GROUPS:
+        if group_name == "risk_score":
+            continue
+        score = calculate_score_group(scored, mappings, group_name)
+        scored[group_name] = score if score is not None else np.nan
+
+    raw_risk, health_risk = calculate_risk_scores(scored, mappings)
+    scored["risk_score_raw"] = raw_risk if raw_risk is not None else np.nan
+    scored["risk_score_health"] = health_risk if health_risk is not None else np.nan
+    scored["negative_persona_candidate"] = (
+        (pd.to_numeric(scored["risk_score_raw"], errors="coerce") >= 70)
+        & (pd.to_numeric(scored.get("value_score", pd.Series(np.nan, index=scored.index)), errors="coerce") < 40)
+    )
+    return add_customer_recommendations(scored)
+
