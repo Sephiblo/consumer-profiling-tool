@@ -15,6 +15,31 @@ def _bucket(value: float | int | None) -> str:
     return "low"
 
 
+def _mean_score(df: pd.DataFrame, column: str) -> float | None:
+    if column not in df.columns:
+        return None
+    value = pd.to_numeric(df[column], errors="coerce").mean()
+    return None if pd.isna(value) else float(value)
+
+
+def _message_strategy_for_persona(persona: str) -> str:
+    if "Strategic Account" in persona:
+        return "Executive value narrative, ROI proof, renewal/expansion messaging, and account-specific next-best action."
+    if "High-Value Loyalist" in persona:
+        return "VIP recognition, early access, personalised cross-sell, service assurance, and low-discount loyalty messaging."
+    if "High-Intent Non-Converter" in persona:
+        return "Friction-removal messaging: trust proof, delivery/return reassurance, basket reminders, and concise conversion nudges."
+    if "At-Risk" in persona:
+        return "Win-back and recovery messaging focused on service fix, reason-for-lapse learning, and controlled retention offer."
+    if "Promotion-Sensitive" in persona:
+        return "Margin-aware promotion, threshold incentives, loyalty points, and urgency only where response evidence supports it."
+    if "Negative Persona" in persona:
+        return "Low-cost diagnostic messaging, product-fit learning, service triage, and no high-cost acquisition pressure."
+    if "Low-Value" in persona:
+        return "Low-cost education or lifecycle automation, preference capture, and selective reactivation."
+    return "General nurture, behaviour-based education, data enrichment prompts, and gradual lifecycle progression."
+
+
 def determine_profile_type(row: pd.Series) -> tuple[str, str, str, str, str, str]:
     """Return persona, action, evidence, confidence, assumptions, limitation."""
     value = _bucket(row.get("value_score"))
@@ -107,7 +132,76 @@ def add_customer_recommendations(scored_df: pd.DataFrame) -> pd.DataFrame:
     result["recommendation_confidence"] = [item[3] for item in recommendations]
     result["recommendation_assumptions"] = [item[4] for item in recommendations]
     result["recommendation_limitation"] = [item[5] for item in recommendations]
+    result["message_strategy"] = result["recommended_profile_type"].map(_message_strategy_for_persona)
     return result
+
+
+def _segment_key_traits(group: pd.DataFrame) -> str:
+    traits = []
+    for column, label in [
+        ("value_score", "value"),
+        ("frequency_loyalty_score", "frequency/loyalty"),
+        ("engagement_score", "engagement"),
+        ("conversion_score", "conversion"),
+        ("risk_score_raw", "risk"),
+        ("b2b_account_fit_score", "B2B fit"),
+    ]:
+        bucket = _bucket(_mean_score(group, column))
+        if bucket != "unknown":
+            traits.append(f"{bucket} {label}")
+    return "; ".join(traits) if traits else "Limited score evidence"
+
+
+def _layered_segment_strategy(group: pd.DataFrame, dominant_persona: str) -> tuple[str, str]:
+    value = _bucket(_mean_score(group, "value_score"))
+    engagement = _bucket(_mean_score(group, "engagement_score"))
+    conversion = _bucket(_mean_score(group, "conversion_score"))
+    risk = _bucket(_mean_score(group, "risk_score_raw"))
+
+    if value == "high" and risk == "high":
+        return (
+            "Prioritise service recovery, personalised win-back, and retention economics before broad upsell.",
+            "Use apology/fix, reason-for-lapse, and controlled high-value recovery messaging.",
+        )
+    if value == "high":
+        return (
+            "Protect margin with VIP retention, cross-sell, loyalty recognition, and early-access propositions.",
+            "Use premium loyalty, recognition, and relevance-led recommendations rather than blanket discounts.",
+        )
+    if value == "medium" and engagement == "high" and conversion in {"low", "unknown"}:
+        return (
+            "Treat as a conversion-development layer: reduce friction, clarify value, and test targeted incentives.",
+            "Use reassurance, product education, comparison proof, and light urgency.",
+        )
+    if value == "medium" and risk == "high":
+        return (
+            "Use selective reactivation with modest incentives and collect churn/friction reasons.",
+            "Use needs-check, preference refresh, and controlled win-back messaging.",
+        )
+    if value == "medium":
+        return (
+            "Use nurture-to-grow journeys, bundle education, and next-best-category recommendations.",
+            "Use benefit-led education and relevance, with incentives reserved for response-tested customers.",
+        )
+    if risk == "high":
+        return (
+            "Keep outreach low-cost, diagnose mismatch, and avoid expensive paid retargeting until fit improves.",
+            "Use concise diagnostic or preference-capture messaging rather than repeated sales pressure.",
+        )
+    if engagement == "high":
+        return (
+            "Develop intent with product education, social proof, and conversion-friction experiments.",
+            "Use browse-based education, trust proof, and gentle next-step prompts.",
+        )
+    if dominant_persona == "General Nurture Customer":
+        return (
+            "Use data-enrichment and low-cost lifecycle nurture before assigning high-budget campaigns.",
+            "Use preference capture, onboarding, and broad benefit education.",
+        )
+    return (
+        "Use low-cost lifecycle automation and monitor for stronger future value, response, or risk signals.",
+        _message_strategy_for_persona(dominant_persona),
+    )
 
 
 def generate_segment_recommendations(scored_df: pd.DataFrame, segment_column: str) -> list[dict[str, str]]:
@@ -117,14 +211,21 @@ def generate_segment_recommendations(scored_df: pd.DataFrame, segment_column: st
     output: list[dict[str, str]] = []
     for segment, group in scored_df.groupby(segment_column, dropna=False):
         persona = group["recommended_profile_type"].mode().iloc[0] if "recommended_profile_type" in group and not group.empty else "Mixed Profile"
-        action = group["recommended_action"].mode().iloc[0] if "recommended_action" in group and not group.empty else "Review behaviour."
+        action, message_strategy = _layered_segment_strategy(group, str(persona))
         evidence = group["recommendation_evidence"].mode().iloc[0] if "recommendation_evidence" in group and not group.empty else "Mixed evidence."
         confidence = group["recommendation_confidence"].mode().iloc[0] if "recommendation_confidence" in group and not group.empty else "low"
         output.append(
             {
                 "segment": str(segment),
+                "size": str(len(group)),
+                "dominant_segment": str(segment),
                 "dominant_persona": str(persona),
+                "key_traits": _segment_key_traits(group),
+                "business_value": _bucket(_mean_score(group, "value_score")),
+                "risk": _bucket(_mean_score(group, "risk_score_raw")),
                 "recommendation": str(action),
+                "recommended_action": str(action),
+                "message_strategy": message_strategy,
                 "evidence_from_data": str(evidence),
                 "confidence_level": str(confidence),
                 "assumptions": "Segment-level averages represent meaningful group behaviour.",
@@ -132,6 +233,30 @@ def generate_segment_recommendations(scored_df: pd.DataFrame, segment_column: st
             }
         )
     return output
+
+
+def build_persona_summary(scored_df: pd.DataFrame, segment_column: str) -> pd.DataFrame:
+    """Return the persona table required by the strategy section."""
+    if scored_df.empty:
+        return pd.DataFrame()
+    if not segment_column or segment_column not in scored_df.columns:
+        segment_column = "recommended_profile_type"
+    rows = []
+    for segment, group in scored_df.groupby(segment_column, dropna=False):
+        persona = group["recommended_profile_type"].mode().iloc[0] if "recommended_profile_type" in group else str(segment)
+        action, message_strategy = _layered_segment_strategy(group, str(persona))
+        rows.append(
+            {
+                "size": int(len(group)),
+                "dominant segment": str(segment),
+                "key traits": _segment_key_traits(group),
+                "business value": _bucket(_mean_score(group, "value_score")),
+                "risk": _bucket(_mean_score(group, "risk_score_raw")),
+                "recommended action": action,
+                "message strategy": message_strategy,
+            }
+        )
+    return pd.DataFrame(rows).sort_values(["business value", "risk", "size"], ascending=[True, False, False])
 
 
 def data_collection_recommendations(missing_pillars: list[str]) -> list[str]:
@@ -147,4 +272,3 @@ def data_collection_recommendations(missing_pillars: list[str]) -> list[str]:
     if not suggestions:
         suggestions.append("Improve longitudinal tracking, campaign costs, margin, and qualitative feedback for deeper ROI diagnostics.")
     return suggestions
-

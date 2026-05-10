@@ -19,11 +19,11 @@ from analysis.lifecycle_analysis import run_lifecycle_analysis
 from analysis.negative_persona import run_negative_persona_analysis
 from analysis.psychographic_analysis import run_psychographic_analysis
 from analysis.quality_analysis import analyze_data_quality
-from analysis.recommendation_engine import data_collection_recommendations, generate_segment_recommendations
+from analysis.recommendation_engine import build_persona_summary, data_collection_recommendations, generate_segment_recommendations
 from analysis.response_model import run_response_model
 from analysis.rfm_analysis import run_rfm_analysis
 from analysis.roi_analysis import run_roi_analysis
-from analysis.score_generator import generate_customer_scores
+from analysis.score_generator import build_scoring_methodology, generate_customer_scores
 from analysis.segment_profiling import metric_comparison_by_segment, rank_segments
 from core.constants import FIELD_ROLES, POLARITIES
 from core.models import ConfirmedFieldMapping
@@ -136,6 +136,8 @@ def run_pipeline(
         active_segment_column = "_generated_cluster" if "_generated_cluster" in scored_df.columns else ""
 
     recommendations = generate_segment_recommendations(scored_df, active_segment_column) if active_segment_column else []
+    persona_summary = build_persona_summary(scored_df, active_segment_column)
+    scoring_methodology = build_scoring_methodology(cleaned_df, mappings)
     negative_personas = run_negative_persona_analysis(scored_df, active_segment_column)
     roi_result = run_roi_analysis(cleaned_df, scored_df, mappings, active_segment_column)
     theory_narrative = generate_theory_narrative(coverage, mode_result, plan.proxy_analyses)
@@ -159,8 +161,11 @@ def run_pipeline(
         segment_profile=segment_profile,
         interpretations=interpretations,
         recommendations=recommendations,
+        persona_summary=persona_summary,
         negative_personas=negative_personas,
         roi_result=roi_result,
+        response_result=response_result,
+        scoring_methodology=scoring_methodology,
     )
 
     return {
@@ -180,6 +185,7 @@ def run_pipeline(
         "segment_profile": segment_profile,
         "interpretations": interpretations,
         "recommendations": recommendations,
+        "persona_summary": persona_summary,
         "negative_personas": negative_personas,
         "roi_result": roi_result,
         "theory_narrative": theory_narrative,
@@ -191,6 +197,7 @@ def run_pipeline(
         "funnel": funnel,
         "rfm": rfm,
         "eda": eda,
+        "scoring_methodology": scoring_methodology,
         "active_segment_column": active_segment_column,
         "data_collection_recommendations": data_collection_recommendations(coverage.missing_pillars),
         "report": report,
@@ -233,6 +240,10 @@ def show_upload() -> None:
     cols[3].metric("Quality warnings", len(quality_report["potential_data_issues"]))
     for issue in quality_report["potential_data_issues"][:5]:
         st.warning(issue)
+    if quality_report.get("business_rule_issues"):
+        with st.expander("Business-rule quality checks / 业务规则质量检查", expanded=True):
+            for issue in quality_report["business_rule_issues"]:
+                st.warning(issue)
     st.dataframe(df.head(20), use_container_width=True)
 
 
@@ -350,6 +361,23 @@ def show_dashboard() -> None:
     cols[0].metric("Mean value", _metric_mean(scored, "value_score"))
     cols[1].metric("Mean engagement", _metric_mean(scored, "engagement_score"))
     cols[2].metric("Mean B2B fit", _metric_mean(scored, "b2b_account_fit_score"))
+    with st.expander("Scoring methodology / 评分方法"):
+        methodology = pipeline.get("scoring_methodology", {})
+        st.write(methodology.get("normalisation", ""))
+        st.write(methodology.get("polarity", ""))
+        rows = []
+        for group in methodology.get("score_groups", []):
+            rows.append(
+                {
+                    "Score": group["score"],
+                    "Formula": group["formula"],
+                    "Fields": ", ".join(field["field"] for field in group["fields"]),
+                    "Weights": ", ".join(f"{field['field']}={field['weight']}" for field in group["fields"]),
+                    "Polarity": ", ".join(f"{field['field']}:{field['polarity']}" for field in group["fields"]),
+                }
+            )
+        if rows:
+            st.dataframe(pd.DataFrame(rows), use_container_width=True)
 
 
 def _metric_mean(df: pd.DataFrame, column: str) -> str:
@@ -416,12 +444,23 @@ def show_strategy() -> None:
     if not pipeline:
         return
     st.subheader("Priority groups")
+    if isinstance(pipeline.get("persona_summary"), pd.DataFrame) and not pipeline["persona_summary"].empty:
+        st.dataframe(pipeline["persona_summary"], use_container_width=True)
     for item in pipeline["recommendations"]:
         st.write(f"**{item['segment']}**")
-        st.write(f"Recommendation: {item['recommendation']}")
+        st.write(f"Recommendation: {item['recommended_action']}")
+        st.write(f"Message strategy: {item['message_strategy']}")
         st.write(f"Evidence: {item['evidence_from_data']}")
         st.write(f"Confidence: {item['confidence_level']}")
         st.caption(f"Assumptions: {item['assumptions']} | Limitation: {item['limitation']}")
+    response_result = pipeline.get("response_result")
+    if response_result:
+        st.subheader("Response prediction model")
+        st.write(f"Target: {response_result.target_field}")
+        if response_result.metrics:
+            st.dataframe(pd.DataFrame([response_result.metrics]), use_container_width=True)
+        for warning in response_result.warnings:
+            st.warning(warning)
     st.subheader("Negative persona warnings")
     st.dataframe(pipeline["negative_personas"], use_container_width=True)
     st.subheader("ROI and marketing effectiveness")
@@ -541,4 +580,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

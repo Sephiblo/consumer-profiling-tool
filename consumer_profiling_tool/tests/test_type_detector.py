@@ -18,6 +18,7 @@ def test_type_detector_detects_v2_field_types():
                 "A long survey answer about lifestyle and buying motivations.",
             ],
             "email_open_rate": ["10%", "20%", "30%", "40%"],
+            "account_health_score": [90, 80, 70, 60],
             "email": ["a@test.com", "b@test.com", "c@test.com", "d@test.com"],
         }
     )
@@ -30,5 +31,6 @@ def test_type_detector_detects_v2_field_types():
     assert profiles["signup_date"].is_datetime_like
     assert profiles["feedback_text"].is_text_like
     assert profiles["email_open_rate"].inferred_type == "percentage_rate"
+    assert not profiles["email_open_rate"].is_sensitive_candidate
+    assert not profiles["account_health_score"].is_sensitive_candidate
     assert profiles["email"].is_sensitive_candidate
-

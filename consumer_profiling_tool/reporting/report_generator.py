@@ -4,7 +4,14 @@ from __future__ import annotations
 
 import pandas as pd
 
-from core.models import AnalysisPlan, ConfirmedFieldMapping, CoverageAssessment, ModeDetectionResult, PrivacyScanResult
+from core.models import (
+    AnalysisPlan,
+    ConfirmedFieldMapping,
+    CoverageAssessment,
+    ModeDetectionResult,
+    PrivacyScanResult,
+    ResponseModelResult,
+)
 
 
 def generate_markdown_report(
@@ -19,15 +26,20 @@ def generate_markdown_report(
     segment_profile: pd.DataFrame | None = None,
     interpretations: list[str] | None = None,
     recommendations: list[dict[str, str]] | None = None,
+    persona_summary: pd.DataFrame | None = None,
     negative_personas: pd.DataFrame | None = None,
     roi_result: dict[str, object] | None = None,
+    response_result: ResponseModelResult | None = None,
+    scoring_methodology: dict[str, object] | None = None,
 ) -> str:
     scored_df = scored_df if scored_df is not None else pd.DataFrame()
     segment_profile = segment_profile if segment_profile is not None else pd.DataFrame()
     interpretations = interpretations or []
     recommendations = recommendations or []
+    persona_summary = persona_summary if persona_summary is not None else pd.DataFrame()
     negative_personas = negative_personas if negative_personas is not None else pd.DataFrame()
     roi_result = roi_result or {}
+    scoring_methodology = scoring_methodology or {}
 
     lines = [
         "# Consumer Profiling Report",
@@ -98,6 +110,11 @@ def generate_markdown_report(
         ]:
             if column in scored_df.columns and scored_df[column].notna().any():
                 lines.append(f"- Mean {column}: {scored_df[column].mean():.2f}")
+    lines.extend(["", "### 8.1 Scoring Methodology"])
+    lines.extend(_scoring_methodology_lines(scoring_methodology))
+
+    lines.extend(["", "## 8.2 Response Prediction Model"])
+    lines.extend(_response_prediction_lines(response_result, analysis_plan))
 
     lines.extend(["", "## 9. Segment or Cluster Analysis"])
     if segment_profile.empty:
@@ -107,6 +124,8 @@ def generate_markdown_report(
     lines.extend(f"- {text}" for text in interpretations)
 
     lines.extend(["", "## 10. Key Personas and Negative Personas"])
+    if not persona_summary.empty:
+        lines.append(persona_summary.to_markdown(index=False))
     if not scored_df.empty and "recommended_profile_type" in scored_df:
         for persona, count in scored_df["recommended_profile_type"].value_counts().items():
             lines.append(f"- {persona}: {count} records")
@@ -117,7 +136,9 @@ def generate_markdown_report(
     if recommendations:
         for item in recommendations:
             lines.append(
-                f"- {item['segment']}: {item['recommendation']} Evidence: {item['evidence_from_data']} Confidence: {item['confidence_level']}."
+                f"- {item['segment']}: {item.get('recommended_action', item['recommendation'])} "
+                f"Message strategy: {item.get('message_strategy', 'N/A')} "
+                f"Evidence: {item['evidence_from_data']} Confidence: {item['confidence_level']}."
             )
     else:
         lines.append("- Use customer-level recommended actions as a first-pass lifecycle plan.")
@@ -150,6 +171,48 @@ def _dimension_text(coverage: CoverageAssessment, name: str) -> str:
     return f"Not available. Suggested data: {dimension.suggested_data_to_collect}"
 
 
+def _scoring_methodology_lines(scoring_methodology: dict[str, object]) -> list[str]:
+    if not scoring_methodology:
+        return ["- Scoring methodology was not generated."]
+    lines = [
+        f"- Normalisation: {scoring_methodology.get('normalisation', 'N/A')}",
+        f"- Polarity handling: {scoring_methodology.get('polarity', 'N/A')}",
+        f"- Field weights: {scoring_methodology.get('weights', 'N/A')}",
+    ]
+    for group in scoring_methodology.get("score_groups", []):
+        fields = group.get("fields", [])
+        field_text = "; ".join(
+            f"{field['field']} ({field['role']}, {field['polarity']}, weight {field['weight']})"
+            for field in fields
+        )
+        lines.append(f"- {group.get('score')}: {group.get('formula')} Fields: {field_text}")
+    return lines
+
+
+def _response_prediction_lines(
+    response_result: ResponseModelResult | None,
+    analysis_plan: AnalysisPlan,
+) -> list[str]:
+    if response_result is None:
+        if "Response prediction model" in analysis_plan.supported_analyses:
+            return ["- Response prediction is available but not included in this report."]
+        return ["- Response prediction was not available because no confirmed binary response target was detected."]
+    lines = [f"- Target field: {response_result.target_field}"]
+    if response_result.metrics:
+        metrics = ", ".join(f"{name}: {value}" for name, value in response_result.metrics.items())
+        lines.append(f"- Model metrics: {metrics}")
+    else:
+        lines.append("- Model metrics were not produced.")
+    lines.extend(f"- Model warning: {warning}" for warning in response_result.warnings)
+    if response_result.top_positive_drivers:
+        drivers = ", ".join(f"{item['feature']} ({item['coefficient']})" for item in response_result.top_positive_drivers[:5])
+        lines.append(f"- Top positive response drivers: {drivers}")
+    if response_result.top_negative_drivers:
+        drivers = ", ".join(f"{item['feature']} ({item['coefficient']})" for item in response_result.top_negative_drivers[:5])
+        lines.append(f"- Top negative response drivers: {drivers}")
+    return lines
+
+
 def _limitations(coverage: CoverageAssessment, analysis_plan: AnalysisPlan) -> list[str]:
     lines = []
     if coverage.missing_pillars:
@@ -161,4 +224,3 @@ def _limitations(coverage: CoverageAssessment, analysis_plan: AnalysisPlan) -> l
     if not lines:
         lines.append("All major profile dimensions have at least limited coverage, but recommendations remain suggestive rather than causal.")
     return [f"- {line}" for line in lines]
-

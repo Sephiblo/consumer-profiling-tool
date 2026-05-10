@@ -1,6 +1,6 @@
 import pandas as pd
 
-from analysis.score_generator import calculate_risk_scores, calculate_score_group
+from analysis.score_generator import build_scoring_methodology, calculate_risk_scores, calculate_score_group
 from core.models import ConfirmedFieldMapping
 
 
@@ -24,3 +24,17 @@ def test_missing_score_groups_return_none():
     mappings = [ConfirmedFieldMapping(name="age", inferred_type="numeric", role="age", polarity="neutral")]
     assert calculate_score_group(df, mappings, "value_score") is None
 
+
+def test_scoring_methodology_explains_formula_weights_and_polarity():
+    df = pd.DataFrame({"spend": [10, 50, 100], "refund_count": [0, 2, 10]})
+    mappings = [
+        ConfirmedFieldMapping(name="spend", inferred_type="numeric", role="monetary_value", polarity="positive"),
+        ConfirmedFieldMapping(name="refund_count", inferred_type="numeric", role="return_refund", polarity="negative"),
+    ]
+
+    methodology = build_scoring_methodology(df, mappings)
+    groups = {item["score"]: item for item in methodology["score_groups"]}
+
+    assert groups["value_score"]["formula"] == "mean(polarity_adjusted_robust_minmax(field_i)) * 100"
+    assert groups["value_score"]["fields"][0]["weight"] == 1
+    assert groups["risk_score"]["fields"][0]["polarity"] == "negative"

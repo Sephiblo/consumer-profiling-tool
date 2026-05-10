@@ -18,6 +18,20 @@ RICHNESS_GROUPS = {
     "psychographic_richness_score",
 }
 
+SCORE_LABELS = {
+    "identity_completeness_score": "Identity completeness",
+    "demographic_richness_score": "Demographic richness",
+    "geographic_richness_score": "Geographic richness",
+    "psychographic_richness_score": "Psychographic richness",
+    "value_score": "Customer/account value",
+    "frequency_loyalty_score": "Frequency and loyalty",
+    "engagement_score": "Engagement",
+    "conversion_score": "Conversion/response",
+    "risk_score": "Risk/friction",
+    "b2b_account_fit_score": "B2B account fit",
+    "profile_quality_score": "Overall profile quality",
+}
+
 
 def _fields_for_group(mappings: list[ConfirmedFieldMapping], group_name: str, df: pd.DataFrame) -> list[ConfirmedFieldMapping]:
     roles = set(SCORE_GROUPS[group_name])
@@ -76,6 +90,66 @@ def calculate_risk_scores(df: pd.DataFrame, mappings: list[ConfirmedFieldMapping
     )
 
 
+def build_scoring_methodology(df: pd.DataFrame, mappings: list[ConfirmedFieldMapping]) -> dict[str, object]:
+    """Explain formulas, field weights, and polarity treatment for generated scores."""
+    methodology: list[dict[str, object]] = []
+    for group_name in SCORE_GROUPS:
+        group_mappings = _fields_for_group(mappings, group_name, df)
+        if not group_mappings:
+            continue
+        weight = round(1 / len(group_mappings), 4)
+        fields = [
+            {
+                "field": mapping.name,
+                "role": mapping.role,
+                "polarity": mapping.polarity,
+                "weight": weight,
+                "treatment": _field_treatment(group_name, mapping),
+            }
+            for mapping in group_mappings
+        ]
+        if group_name in RICHNESS_GROUPS:
+            formula = "mean(non_missing(field_i)) * 100"
+        elif group_name == "risk_score":
+            formula = "mean(risk_normalized(field_i)) * 100; risk_score_health = 100 - risk_score_raw"
+        else:
+            formula = "mean(polarity_adjusted_robust_minmax(field_i)) * 100"
+        methodology.append(
+            {
+                "score": group_name,
+                "label": SCORE_LABELS.get(group_name, group_name),
+                "formula": formula,
+                "fields": fields,
+            }
+        )
+    return {
+        "normalisation": (
+            "Numeric fields are coerced to numbers, missing values are median-imputed, "
+            "and values are robust-minmax scaled using the 1st and 99th percentiles to reduce outlier impact."
+        ),
+        "polarity": (
+            "Positive polarity means higher raw values raise the score. Negative polarity means higher raw values are inverted "
+            "because they represent risk, friction, recency/lapse, refunds, complaints, churn, or abandonment."
+        ),
+        "weights": "Within each score group, available fields currently use equal weights.",
+        "score_groups": methodology,
+    }
+
+
+def _field_treatment(group_name: str, mapping: ConfirmedFieldMapping) -> str:
+    if group_name in RICHNESS_GROUPS:
+        return "Completeness indicator: present = 1, missing = 0."
+    if group_name == "risk_score":
+        if mapping.polarity == "negative":
+            return "Higher values increase raw risk and reduce risk health."
+        return "Higher values are treated as protective and inverted for raw risk."
+    if mapping.polarity == "negative":
+        return "Robust-minmax scaled, then inverted so lower-risk values score higher."
+    if mapping.polarity == "positive":
+        return "Robust-minmax scaled so higher values score higher."
+    return "Robust-minmax scaled with neutral/unknown polarity; review mapping if this should be directional."
+
+
 def generate_customer_scores(
     df: pd.DataFrame,
     mappings: list[ConfirmedFieldMapping],
@@ -105,4 +179,3 @@ def generate_customer_scores(
         & (pd.to_numeric(scored.get("value_score", pd.Series(np.nan, index=scored.index)), errors="coerce") < 40)
     )
     return add_customer_recommendations(scored)
-

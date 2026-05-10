@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-import re
-
 import pandas as pd
 
 from core.constants import SENSITIVE_NAME_HINTS
@@ -16,18 +14,111 @@ PRIVACY_NOTICE = (
     "This tool does not provide legal advice; review applicable data-protection rules before operational use."
 )
 
+DIRECT_PII_HINTS = {
+    "email",
+    "e_mail",
+    "phone",
+    "mobile",
+    "telephone",
+    "tel",
+    "address",
+    "home_address",
+    "street_address",
+    "postal_address",
+    "postcode",
+    "postal_code",
+    "zip",
+    "latitude",
+    "longitude",
+}
+
+PERSON_NAME_HINTS = {"name", "full_name", "first_name", "last_name", "surname"}
+PERSON_CONTEXT_HINTS = {"customer", "client", "contact", "user", "member", "person", "individual"}
+SPECIAL_CATEGORY_HINTS = {
+    "gender",
+    "sex",
+    "ethnicity",
+    "religion",
+    "political",
+    "biometric",
+    "medical",
+    "diagnosis",
+    "disability",
+}
+BUSINESS_HEALTH_HINTS = {"account_health", "customer_health_score", "health_score", "account_health_score"}
+BEHAVIOURAL_BUSINESS_HINTS = {
+    "spend",
+    "revenue",
+    "sales",
+    "amount",
+    "monetary",
+    "frequency",
+    "orders",
+    "order_count",
+    "purchase",
+    "recency",
+    "session",
+    "click",
+    "page_view",
+    "engagement",
+    "open_rate",
+    "email_open",
+    "cart",
+    "abandon",
+    "churn",
+    "return",
+    "refund",
+    "complaint",
+    "conversion",
+    "response",
+    "score",
+}
+
 
 def detect_sensitive_field(column_name: str, series: pd.Series | None = None, row_count: int | None = None) -> tuple[bool, str, list[str]]:
-    """Flag likely personal or sensitive fields by name and simple value patterns."""
+    """Flag likely PII/sensitive fields without treating ordinary behaviour metrics as sensitive."""
     normalised = normalise_name(column_name)
+    tokens = set(normalised.split("_"))
     reasons: list[str] = []
     risk_level = "low"
+    is_business_metric = any(business_hint in normalised for business_hint in BEHAVIOURAL_BUSINESS_HINTS)
 
-    for hint in SENSITIVE_NAME_HINTS:
-        if hint in normalised:
-            reasons.append(f"Column name contains privacy/sensitive hint '{hint}'.")
-            risk_level = "medium"
-            break
+    if normalised in BUSINESS_HEALTH_HINTS:
+        return False, risk_level, []
+
+    direct_hint = next((hint for hint in DIRECT_PII_HINTS if normalised == hint or hint in normalised), None)
+    if direct_hint and not (direct_hint in {"email", "phone", "mobile", "telephone", "tel"} and is_business_metric):
+        reasons.append(f"Column name contains direct PII/location hint '{direct_hint}'.")
+        risk_level = "medium"
+
+    name_hint = normalised in PERSON_NAME_HINTS or any(hint in normalised for hint in {"full_name", "first_name", "last_name"})
+    contextual_name = "name" in tokens and bool(tokens & PERSON_CONTEXT_HINTS)
+    if name_hint or contextual_name:
+        reasons.append("Column name appears to identify a person.")
+        risk_level = "medium"
+
+    special_hint = next(
+        (
+            hint
+            for hint in SPECIAL_CATEGORY_HINTS
+            if normalised == hint or hint in tokens or hint in normalised
+        ),
+        None,
+    )
+    if special_hint:
+        reasons.append(f"Column name contains sensitive demographic/category hint '{special_hint}'.")
+        risk_level = "medium"
+
+    if "health" in tokens and normalised not in BUSINESS_HEALTH_HINTS:
+        reasons.append("Column name may refer to personal health rather than account health.")
+        risk_level = "medium"
+
+    if not reasons:
+        for hint in SENSITIVE_NAME_HINTS:
+            if hint in normalised and not is_business_metric:
+                reasons.append(f"Column name contains privacy/sensitive hint '{hint}'.")
+                risk_level = "medium"
+                break
 
     if series is not None:
         text_sample = series.dropna().astype(str).head(100)
@@ -72,4 +163,3 @@ def scan_privacy(
         flagged_fields=flags,
         report_excluded_fields=excluded,
     )
-
